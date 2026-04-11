@@ -51,7 +51,7 @@ class ModelManager:
                     # Download the model
                     model_data = httpx.get(model_url, timeout=60.0).content
                     buffer = io.BytesIO(model_data)
-                    state_dict = torch.load(buffer, weights_only=True)
+                    state_dict = torch.load(buffer, weights_only=False)
                     self.model.load_state_dict(state_dict)
                     print("Successfully loaded model from Vercel Blob.")
                 else:
