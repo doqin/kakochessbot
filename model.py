@@ -48,16 +48,20 @@ class ModelManager:
                 urls = [blob["url"] for blob in data.get("blobs", []) if blob["pathname"] == self.model_filename]
                 if urls:
                     model_url = urls[0]
-                    # Download the model
-                    model_data = httpx.get(model_url, timeout=60.0).content
-                    buffer = io.BytesIO(model_data)
-                    state_dict = torch.load(buffer, weights_only=False)
-                    self.model.load_state_dict(state_dict)
-                    print("Successfully loaded model from Vercel Blob.")
+                    # Download the model with Authorization headers for private blobs
+                    response = httpx.get(model_url, headers=headers, timeout=60.0)
+                    if response.status_code == 200:
+                        model_data = response.content
+                        buffer = io.BytesIO(model_data)
+                        state_dict = torch.load(buffer, weights_only=False)
+                        self.model.load_state_dict(state_dict)
+                        print("Successfully loaded model from Vercel Blob.")
+                    else:
+                        print(f"Failed to download model from Blob. Status: {response.status_code}, Body: {response.text[:100]}")
                 else:
-                    print("Model rarely found in Blob. Using a fresh model.")
+                    print("Model file not found in Blob. Using a fresh model.")
             else:
-                print(f"Failed to list Blob contents. {response.status_code}")
+                print(f"Failed to list Blob contents. {response.status_code}, Body: {response.text[:100]}")
         except Exception as e:
             print(f"Failed to load model from Vercel Blob: {e}")
 

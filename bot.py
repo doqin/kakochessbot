@@ -45,7 +45,15 @@ def evaluate_board(board: chess.Board) -> float:
         result = board.result()
         if result == '1-0': return 1.0
         if result == '0-1': return -1.0
-        return 0.0 # Draw
+        
+        # Punish draws: return a value that reflects the failure to win
+        material_val = get_material_balance(board)
+        # If White was ahead (material_val > 0), a draw is a "loss" of that advantage.
+        # If Black was ahead (material_val < 0), a draw is a "loss" for Black (gain for White).
+        # We also add a baseline 'contempt' factor to avoid draws even in equal positions.
+        base_contempt = 0.3
+        penalty = (material_val * 0.5) + (base_contempt if board.turn == chess.WHITE else -base_contempt)
+        return -penalty # Flip sign: White-centric evaluation
         
     tensor = fen_to_tensor(board.fen())
     model_manager.model.eval()
@@ -137,8 +145,16 @@ def train_bot(game_fens: list, result_val: float):
     total_loss = 0.0
     
     # TD Discount Logic: Cascades the reward backwards.
-    # The final move gets 100% of the result. Moves further back in time decay by 5%.
-    # This specifically forces it to learn the *actual* late-game moves that caused the win/loss.
+    # If it's a draw, we calculate a "punishment" reward instead of 0.0
+    if result_val == 0.0 and game_fens:
+        final_board = chess.Board(game_fens[-1])
+        material_val = get_material_balance(final_board)
+        # Punish whoever was ahead for failing to win, or whoever moved into a draw.
+        # Turn information is preserved in the board from the last FEN.
+        base_contempt = 0.3
+        penalty = (material_val * 0.5) + (base_contempt if final_board.turn == chess.WHITE else -base_contempt)
+        result_val = -penalty
+
     targets = []
     current_target = result_val
     discount_factor = 0.95
