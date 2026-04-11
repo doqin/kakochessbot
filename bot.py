@@ -23,6 +23,22 @@ def fen_to_tensor(fen: str) -> torch.Tensor:
             
     return tensor
 
+def get_material_balance(board: chess.Board) -> float:
+    wp = len(board.pieces(chess.PAWN, chess.WHITE))
+    bp = len(board.pieces(chess.PAWN, chess.BLACK))
+    wn = len(board.pieces(chess.KNIGHT, chess.WHITE))
+    bn = len(board.pieces(chess.KNIGHT, chess.BLACK))
+    wb = len(board.pieces(chess.BISHOP, chess.WHITE))
+    bb = len(board.pieces(chess.BISHOP, chess.BLACK))
+    wr = len(board.pieces(chess.ROOK, chess.WHITE))
+    br = len(board.pieces(chess.ROOK, chess.BLACK))
+    wq = len(board.pieces(chess.QUEEN, chess.WHITE))
+    bq = len(board.pieces(chess.QUEEN, chess.BLACK))
+    
+    balance = (wp - bp)*1 + (wn - bn)*3 + (wb - bb)*3 + (wr - br)*5 + (wq - bq)*9
+    # Map a 9-point queen advantage to a massive 0.45 swing towards `1.0` or `-1.0`
+    return min(max(balance * 0.05, -1.0), 1.0)
+
 def evaluate_board(board: chess.Board) -> float:
     """Evaluates the board using the Neural Network."""
     if board.is_game_over():
@@ -34,8 +50,13 @@ def evaluate_board(board: chess.Board) -> float:
     tensor = fen_to_tensor(board.fen())
     model_manager.model.eval()
     with torch.no_grad():
-        val = model_manager.model(tensor).item()
-    return val
+        nn_val = model_manager.model(tensor).item()
+        
+    material_val = get_material_balance(board)
+    
+    # 60% weight to pattern recognition, 40% explicitly to material survival
+    combined_val = (nn_val * 0.6) + (material_val * 0.4)
+    return combined_val
 
 def alphabeta(board: chess.Board, depth: int, alpha: float, beta: float, maximizing_player: bool) -> float:
     if depth == 0 or board.is_game_over():
@@ -115,13 +136,23 @@ def train_bot(game_fens: list, result_val: float):
     model_manager.model.train()
     total_loss = 0.0
     
-    # We will compute MSE between each position's evaluation and the final game result.
-    # In RL, we might use TD learning, but for simple training, this is an MC update.
-    target = torch.tensor([result_val], dtype=torch.float32)
+    # TD Discount Logic: Cascades the reward backwards.
+    # The final move gets 100% of the result. Moves further back in time decay by 5%.
+    # This specifically forces it to learn the *actual* late-game moves that caused the win/loss.
+    targets = []
+    current_target = result_val
+    discount_factor = 0.95
     
-    for fen in game_fens:
+    for _ in reversed(game_fens):
+        targets.append(current_target)
+        current_target *= discount_factor
+    targets.reverse()
+    
+    for i, fen in enumerate(game_fens):
         tensor = fen_to_tensor(fen)
         prediction = model_manager.model(tensor)
+        
+        target = torch.tensor([targets[i]], dtype=torch.float32)
         
         loss = model_manager.criterion(prediction, target)
         model_manager.optimizer.zero_grad()
