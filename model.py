@@ -8,28 +8,102 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-class ChessNN(nn.Module):
-    def __init__(self):
-        super(ChessNN, self).__init__()
-        # Board representation: 64 squares * 12 piece types
-        self.fc1 = nn.Linear(768, 256)
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 64)
-        self.output = nn.Linear(64, 1) # Value network: evaluation between -1 (Black winning) and 1 (White winning)
+class SEBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super(SEBlock, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        return torch.tanh(self.output(x))
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+class ResBlock(nn.Module):
+    def __init__(self, channels):
+        super(ResBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
+        self.se = SEBlock(channels)
+
+    def forward(self, x):
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.se(out)
+        out += residual
+        return F.relu(out)
+
+class ChessCNN(nn.Module):
+    def __init__(self):
+        super(ChessCNN, self).__init__()
+        # Input channel size increased to 20 for Tactical Vision
+        # (12 pieces + 4 castling + 1 EP + 1 Turn + 2 Attack Maps)
+        self.conv_input = nn.Conv2d(20, 64, kernel_size=3, padding=1)
+        self.bn_input = nn.BatchNorm2d(64)
+        
+        # 4 Residual Blocks with Squeeze-and-Excitation
+        self.res_blocks = nn.Sequential(
+            ResBlock(64), ResBlock(64), ResBlock(64), ResBlock(64)
+        )
+        
+        # Policy head (predicts moves: 4096 possible transitions)
+        self.policy_conv = nn.Conv2d(64, 32, kernel_size=1)
+        self.policy_bn = nn.BatchNorm2d(32)
+        self.policy_fc = nn.Linear(32 * 8 * 8, 4096)
+        
+        # Value head (predicts game outcome: -1 to 1)
+        self.value_conv = nn.Conv2d(64, 1, kernel_size=1)
+        self.value_bn = nn.BatchNorm2d(1)
+        self.value_fc1 = nn.Linear(1 * 8 * 8, 64)
+        self.value_fc2 = nn.Linear(64, 1)
+
+        # Auxiliary Material Head (predicts material balance: -1 to 1)
+        self.material_conv = nn.Conv2d(64, 1, kernel_size=1)
+        self.material_bn = nn.BatchNorm2d(1)
+        self.material_fc1 = nn.Linear(1 * 8 * 8, 32)
+        self.material_fc2 = nn.Linear(32, 1)
+
+    def forward(self, x):
+        # x is shape: (Batch, 20, 8, 8)
+        x = F.relu(self.bn_input(self.conv_input(x)))
+        x = self.res_blocks(x)
+        
+        # Policy prediction
+        p = F.relu(self.policy_bn(self.policy_conv(x)))
+        p = p.reshape(p.size(0), -1)
+        p = self.policy_fc(p)
+        
+        # Value prediction
+        v = F.relu(self.value_bn(self.value_conv(x)))
+        v = v.reshape(v.size(0), -1)
+        v = F.relu(self.value_fc1(v))
+        v = torch.tanh(self.value_fc2(v))
+
+        # Material prediction
+        m = F.relu(self.material_bn(self.material_conv(x)))
+        m = m.reshape(m.size(0), -1)
+        m = F.relu(self.material_fc1(m))
+        m = torch.tanh(self.material_fc2(m))
+        
+        return p, v, m
 
 class ModelManager:
     def __init__(self):
-        self.model = ChessNN()
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
+        self.model = ChessCNN()
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.0001, weight_decay=1e-4)
         self.criterion = nn.MSELoss()
         self.blob_token = os.environ.get("BLOB_READ_WRITE_TOKEN", "")
         self.model_filename = "chess_model.pt"
+        self.onnx_filename = "chess_model.onnx"
         self.load_model()
 
     def load_model(self):
@@ -54,14 +128,17 @@ class ModelManager:
                         model_data = response.content
                         buffer = io.BytesIO(model_data)
                         state_dict = torch.load(buffer, weights_only=False)
-                        self.model.load_state_dict(state_dict)
-                        print("Successfully loaded model from Vercel Blob.")
+                        try:
+                            self.model.load_state_dict(state_dict)
+                            print("Successfully loaded model from Vercel Blob.")
+                        except RuntimeError as re:
+                            print(f"Architecture mismatch (likely due to upgrade to 20-plane Tactical CNN): {re}. Starting fresh.")
                     else:
-                        print(f"Failed to download model from Blob. Status: {response.status_code}, Body: {response.text[:100]}")
+                        print(f"Failed to download model from Blob. Status: {response.status_code}")
                 else:
                     print("Model file not found in Blob. Using a fresh model.")
             else:
-                print(f"Failed to list Blob contents. {response.status_code}, Body: {response.text[:100]}")
+                print(f"Failed to list Blob contents. {response.status_code}")
         except Exception as e:
             print(f"Failed to load model from Vercel Blob: {e}")
 
@@ -72,9 +149,27 @@ class ModelManager:
             return
 
         try:
-            buffer = io.BytesIO()
-            torch.save(self.model.state_dict(), buffer)
-            buffer.seek(0)
+            # 1. Save standard state dict (.pt)
+            buffer_pt = io.BytesIO()
+            torch.save(self.model.state_dict(), buffer_pt)
+            buffer_pt.seek(0)
+            
+            # 2. Export ONNX (.onnx)
+            self.model.eval()
+            buffer_onnx = io.BytesIO()
+            dummy_input = torch.randn(1, 20, 8, 8)
+            torch.onnx.export(
+                self.model, dummy_input, buffer_onnx, 
+                input_names=['input'], output_names=['policy', 'value', 'material'],
+                dynamic_axes={'input': {0: 'batch_size'}, 'policy': {0: 'batch_size'}, 'value': {0: 'batch_size'}, 'material': {0: 'batch_size'}}
+            )
+            self.model.train()
+            buffer_onnx.seek(0)
+            
+            # Save locally so FastAPI can serve it directly to the frontend
+            with open(self.onnx_filename, 'wb') as f:
+                f.write(buffer_onnx.read())
+            buffer_onnx.seek(0)
             
             headers = {
                 "Authorization": f"Bearer {self.blob_token}",
@@ -84,18 +179,26 @@ class ModelManager:
                 "x-allow-overwrite": "1"
             }
             
-            # Vercel Blob upload endpoint
-            response = httpx.put(
+            # Upload basic .pt state dict
+            httpx.put(
                 f"https://blob.vercel-storage.com/{self.model_filename}",
                 headers=headers,
-                content=buffer.read(),
+                content=buffer_pt.read(),
                 timeout=60.0
             )
             
-            if response.status_code == 200:
-                print("Successfully saved model to Vercel Blob.")
+            # Upload ONNX model file
+            res_onnx = httpx.put(
+                f"https://blob.vercel-storage.com/{self.onnx_filename}",
+                headers=headers,
+                content=buffer_onnx.read(),
+                timeout=90.0
+            )
+            
+            if res_onnx.status_code == 200:
+                print("Successfully saved Tactical CNN and exported ONNX model to Blob.")
             else:
-                print(f"Failed to save model. Status: {response.status_code}, Response: {response.text}")
+                print(f"Failed to save ONNX to Blob. Status: {res_onnx.status_code}, Response: {res_onnx.text}")
         except Exception as e:
             print(f"Error saving model to Vercel Blob: {e}")
 
