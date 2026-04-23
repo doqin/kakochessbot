@@ -8,11 +8,16 @@ dependencies = [
     "chess>=1.11.2",
     "fastapi>=0.135.3",
     "httpx>=0.28.1",
+    "onnx>=1.16.0",
+    "onnx-ir>=0.1.12",
+    "onnxscript>=0.1.0",
     "pydantic>=2.12.5",
     "python-dotenv>=1.2.2",
     "numpy>=1.26.0",
     "torch>=2.11.0",
     "uvicorn>=0.44.0",
+    "huggingface-hub>=0.20.0",
+    "safetensors>=0.4.0",
 ]
 
 [[tool.uv.index]]
