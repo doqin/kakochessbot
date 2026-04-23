@@ -33,6 +33,6 @@ jobs:
       - name: Validate source compiles
         run: uv run python -m compileall .
 
-      - name: Run app and health check
-        shell: bash
-        run: uv run uvicorn main:app --port 8000
+      - name: Restart service
+        run: | 
+          sudo systemctl restart chessbot.service
