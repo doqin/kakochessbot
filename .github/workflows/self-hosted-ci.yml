@@ -10,6 +10,10 @@ on:
 jobs:
   validate:
     runs-on: [self-hosted, Linux, X64]
+    env:
+      BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN || '' }}
+      ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME || 'admin' }}
+      ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD || 'password' }}
 
     steps:
       - name: Checkout
@@ -28,3 +32,28 @@ jobs:
 
       - name: Validate source compiles
         run: uv run python -m compileall .
+
+      - name: Run app and health check
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          uv run uvicorn main:app --host 127.0.0.1 --port 8000 > /tmp/uvicorn.log 2>&1 &
+          APP_PID=$!
+
+          cleanup() {
+            kill "$APP_PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          for i in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8000/ >/dev/null; then
+              echo "Health check passed"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "App failed to become healthy in time"
+          cat /tmp/uvicorn.log
+          exit 1
