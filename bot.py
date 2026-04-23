@@ -6,32 +6,30 @@ from typing import Optional
 
 def fen_to_tensor(fen: str) -> torch.Tensor:
     """
-    Converts a FEN string to a (1, 64, 12) sequence tensor with PERSPECTIVE flipping.
-    Each of the 64 tokens is a 12-dimensional vector identifying the piece.
+    Converts a FEN string to a (1, 13, 8, 8) tensor.
+    13 planes: 6 White pieces, 6 Black pieces, 1 side-to-move.
     """
     board = chess.Board(fen)
-    # (Batch, Sequence, Features)
-    tensor = torch.zeros((1, 64, 12), dtype=torch.float32)
+    tensor = torch.zeros((1, 13, 8, 8), dtype=torch.float32)
     
     piece_to_index = {
         chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
         chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
     }
     
-    current_turn = board.turn # True for White, False for Black
-    
     for sq in chess.SQUARES:
         piece = board.piece_at(sq)
         if piece is not None:
-            # Determine relative color
-            is_my_piece = (piece.color == current_turn)
-            color_offset = 0 if is_my_piece else 6
-            
-            # Determine relative square index (Perspective flip)
-            display_sq = sq if current_turn == chess.WHITE else (sq ^ 56)
-            
+            color_offset = 0 if piece.color == chess.WHITE else 6
             idx_feat = piece_to_index[piece.piece_type] + color_offset
-            tensor[0, display_sq, idx_feat] = 1.0
+            
+            row = sq // 8
+            col = sq % 8
+            tensor[0, idx_feat, row, col] = 1.0
+            
+    # Plane 12: Side to move (1.0 for White, 0.0 for Black)
+    if board.turn == chess.WHITE:
+        tensor[0, 12, :, :] = 1.0
             
     return tensor
 

@@ -16,76 +16,70 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-class ChessDistilledTransformer(nn.Module):
-    def __init__(self, embed_dim=128, nhead=4, num_layers=2):
-        super(ChessDistilledTransformer, self).__init__()
-        # 12 piece types as input features for each of the 64 squares
-        self.embedding = nn.Linear(12, embed_dim)
-        self.pos_emb = nn.Parameter(torch.zeros(1, 64, embed_dim))
-        
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim, 
-            nhead=nhead, 
-            dim_feedforward=256, 
-            dropout=0.1,
-            batch_first=True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        
-        self.value_head = nn.Sequential(
-            nn.Linear(embed_dim, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Tanh()
-        )
+class ResBlock(nn.Module):
+    def __init__(self, channels):
+        super(ResBlock, self).__init__()
+        self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
 
     def forward(self, x):
-        # x shape: (Batch, 64, 12)
-        x = self.embedding(x) + self.pos_emb
-        x = self.transformer(x)
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual
+        return F.relu(out)
+
+class ChessResNet(nn.Module):
+    def __init__(self, num_blocks=6, channels=64):
+        super(ChessResNet, self).__init__()
+        # Input: (Batch, 13, 8, 8)
+        # Planes: 6 White, 6 Black, 1 Side-to-move
+        self.start_conv = nn.Conv2d(13, channels, kernel_size=3, padding=1)
+        self.start_bn = nn.BatchNorm2d(channels)
         
-        # Aggregate across sequence (Global Average Pooling)
-        x = x.mean(dim=1)
-        return self.value_head(x)
+        self.res_blocks = nn.ModuleList([ResBlock(channels) for _ in range(num_blocks)])
+        
+        # Value Head
+        self.value_conv = nn.Conv2d(channels, 1, kernel_size=1)
+        self.value_bn = nn.BatchNorm2d(1)
+        self.value_fc1 = nn.Linear(64, 32)
+        self.value_fc2 = nn.Linear(32, 1)
+        
+        # Policy Head (Future-proofing for better move selection)
+        self.policy_conv = nn.Conv2d(channels, 2, kernel_size=1)
+        self.policy_bn = nn.BatchNorm2d(2)
+        self.policy_fc = nn.Linear(2 * 64, 4096) # Simplified policy: 64x64 possible move indices
+
+    def forward(self, x):
+        # x shape: (Batch, 13, 8, 8)
+        x = F.relu(self.start_bn(self.start_conv(x)))
+        for block in self.res_blocks:
+            x = block(x)
+            
+        # Value Head
+        v = F.relu(self.value_bn(self.value_conv(x)))
+        v = v.view(-1, 64)
+        v = F.relu(self.value_fc1(v))
+        value = torch.tanh(self.value_fc2(v))
+        
+        return value
 
 class ModelManager:
     def __init__(self):
-        self.model = ChessDistilledTransformer()
-        # Use AdamW for better fine-tuning stability
+        self.model = ChessResNet()
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.0001)
         self.criterion = nn.MSELoss()
         self.blob_token = os.environ.get("BLOB_READ_WRITE_TOKEN", "")
-        self.model_filename = "chess_model.pt"
-        self.onnx_filename = "chess_model.onnx"
-        self.hf_repo_id = "Maxlegrec/ChessBot"
-        self.hf_filename = "model.safetensors"
-        self.last_export_error = None
+        self.model_filename = "chess_model_v2.pt"
         self.last_checkpoint_load_error = None
         self._loaded_checkpoint = False
         
         self.load_model()
         
-        # If no local/blob model exists, download from Hugging Face
-        if not os.path.exists(self.model_filename) and not hasattr(self, '_loaded_from_blob'):
-            self.download_starter_weights()
-            if not self._loaded_checkpoint:
-                self.seed_starter_knowledge() # Ensure seeded weights are included in first ONNX snapshot
-            # Immediately export to ONNX so the browser gets the fresh HF weights
-            try:
-                self.export_to_onnx_sync()
-            except Exception as export_error:
-                print(f"[ModelManager] Initial ONNX export failed: {export_error}")
-        
         if not self._loaded_checkpoint:
-            self.seed_starter_knowledge() # Layers basic piece values on top of fresh weights only.
-
-        # Keep the inference endpoint available after startup even when only
-        # PyTorch weights were loaded from Blob and local ONNX is missing.
-        if not os.path.exists(self.onnx_filename):
-            try:
-                self.export_to_onnx_sync()
-            except Exception as export_error:
-                print(f"[ModelManager] Startup ONNX export failed: {export_error}")
+            self.seed_starter_knowledge()
 
     def load_model(self):
         """
@@ -108,12 +102,12 @@ class ModelManager:
                     response = httpx.get(model_url, headers=headers, timeout=60.0)
                     if response.status_code == 200:
                         try:
-                            self.model.load_state_dict(torch.load(io.BytesIO(response.content), weights_only=False))
+                            self.model.load_state_dict(torch.load(io.BytesIO(response.content), map_location="cpu", weights_only=False))
                             print("Successfully loaded model from Vercel Blob.")
                             self._loaded_from_blob = True
                             self._loaded_checkpoint = True
                         except Exception as architecture_error:
-                            print(f"Architecture mismatch: {architecture_error}. Re-initializing Distilled Transformer.")
+                            print(f"Architecture mismatch: {architecture_error}. Re-initializing ResNet.")
                             self.reset_model_sync()
                     else:
                         print(f"Failed to download model. Status: {response.status_code}")
@@ -125,10 +119,10 @@ class ModelManager:
             print(f"Failed to load model from Vercel Blob: {e}")
 
     async def save_model(self):
-        """Asynchronously saves PyTorch model and re-exports ONNX."""
+        """Asynchronously saves PyTorch model."""
         if not self.blob_token:
             print("No BLOB_READ_WRITE_TOKEN. Saving locally only.")
-            await self.export_to_onnx(upload_to_blob=False)
+            torch.save(self.model.state_dict(), self.model_filename)
             return
 
         try:
@@ -159,96 +153,7 @@ class ModelManager:
         except Exception as e:
             print(f"Error saving model to Vercel Blob: {e}")
 
-        await self.export_to_onnx(upload_to_blob=True)
-
-    async def export_to_onnx(self, upload_to_blob=True):
-        """Asynchronously exports ONNX and optionally uploads it to Blob."""
-        try:
-            onnx_bytes = await asyncio.to_thread(self.export_to_onnx_sync)
-            if not onnx_bytes:
-                self.last_export_error = "ONNX export produced empty artifact."
-                return False
-            self.last_export_error = None
-            print(f"ONNX export complete ({len(onnx_bytes)} bytes). Local file updated.")
-        except Exception as e:
-            print(f"ONNX export failed: {e}")
-            self.last_export_error = str(e)
-            return False
-
-        if not upload_to_blob:
-            return True
-
-        if not self.blob_token:
-            return True
-
-        try:
-            # Upload to Vercel Blob...
-            headers = {
-                "Authorization": f"Bearer {self.blob_token}",
-                "x-api-version": "7",
-                "x-vercel-blob-access": "public",
-                "x-add-random-suffix": "0",
-                "x-allow-overwrite": "1",
-                "Content-Type": "application/octet-stream"
-            }
-            async with httpx.AsyncClient() as client:
-                response = await client.put(
-                    f"https://blob.vercel-storage.com/{self.onnx_filename}",
-                    headers=headers,
-                    content=onnx_bytes,
-                    timeout=120.0
-                )
-                if response.status_code != 200:
-                    headers["x-vercel-blob-access"] = "private"
-                    fallback_response = await client.put(
-                        f"https://blob.vercel-storage.com/{self.onnx_filename}",
-                        headers=headers,
-                        content=onnx_bytes,
-                        timeout=120.0
-                    )
-                    if fallback_response.status_code != 200:
-                        self.last_export_error = (
-                            f"Blob upload failed. public={response.status_code}, private={fallback_response.status_code}"
-                        )
-                        return False
-        except Exception as e:
-            print(f"Error uploading ONNX: {e}")
-            self.last_export_error = str(e)
-            return False
-
-        return True
-
-    def export_to_onnx_sync(self):
-        """Synchronous version of ONNX export."""
-        self.model.eval()
-        dummy_input = torch.zeros(1, 64, 12, dtype=torch.float32)
-
-        # Export only if model honors the value-head contract used by frontend.
-        with torch.no_grad():
-            dummy_output = self.model(dummy_input)
-        if dummy_output.ndim != 2 or dummy_output.shape[1] != 1:
-            raise RuntimeError(
-                f"Invalid model output shape for ONNX export: {tuple(dummy_output.shape)} (expected [batch, 1])."
-            )
-        if not torch.isfinite(dummy_output).all():
-            raise RuntimeError("Model produced non-finite values on dummy input; aborting ONNX export.")
-
-        buffer = io.BytesIO()
-        try:
-            torch.onnx.export(
-                self.model, dummy_input, buffer,
-                export_params=True, opset_version=18, do_constant_folding=True,
-                input_names=["board"], output_names=["value"],
-                dynamic_axes={"board": {0: "batch_size"}, "value": {0: "batch_size"}}
-            )
-        except ModuleNotFoundError as e:
-            if e.name == "onnxscript":
-                raise RuntimeError("Missing dependency 'onnxscript' required for ONNX export.")
-            raise
-        onnx_bytes = buffer.getvalue()
-        with open(self.onnx_filename, "wb") as f:
-            f.write(onnx_bytes)
-        return onnx_bytes
+    # Removed ONNX export methods as we now run purely on backend.
 
     def _load_checkpoint_compat(self, checkpoint: dict, source: str):
         """
@@ -331,37 +236,32 @@ class ModelManager:
 
         # Local cleanup
         if os.path.exists(self.model_filename): os.remove(self.model_filename)
-        if os.path.exists(self.onnx_filename): os.remove(self.onnx_filename)
         
-        # Save fresh model locally; Blob upload happens in scheduled save cycle.
-        await self.export_to_onnx(upload_to_blob=False)
+        # Save fresh model locally
+        torch.save(self.model.state_dict(), self.model_filename)
 
     def reset_model_sync(self):
         """Internal synchronous reset."""
-        self.model = ChessDistilledTransformer()
+        self.model = ChessResNet()
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.0001)
         self._loaded_checkpoint = False
-        self.download_starter_weights()
-        if not self._loaded_checkpoint:
-            self.seed_starter_knowledge()
+        self.seed_starter_knowledge()
 
     def seed_starter_knowledge(self):
         """
-        Seeds the Transformer embeddings with basic chess piece knowledge
-        (P=1, N=3, B=3, R=5, Q=9) to avoid starting from total noise.
-        This provides an 'Intermediate Base' instantly.
+        Seeds the ResNet start conv with basic chess piece knowledge.
+        We adjust the first layer weights to respond to piece values.
         """
-        print("[ModelManager] Seeding starter knowledge into embeddings...")
+        print("[ModelManager] Seeding starter knowledge into ResNet...")
         with torch.no_grad():
-            # Initialize embedding weights based on piece values
-            # Piece indices: P=0, N=1, B=2, R=3, Q=4, K=5
-            # Offset for opponent: +6
-            vals = [1.0, 3.0, 3.2, 5.0, 9.0, 1.0] # Piece values
+            # Initial conv layer: 13 input planes to 64 output channels
+            # Piece indices: P=0, N=1, B=2, R=3, Q=4, K=5 (White), 6-11 (Black), 12 (Turn)
+            vals = [1.0, 3.0, 3.2, 5.0, 9.0, 1.0]
             for i, v in enumerate(vals):
-                # Our pieces (positive)
-                self.model.embedding.weight[:, i] = v * 0.1
-                # Opponent pieces (negative)
-                self.model.embedding.weight[:, i+6] = -v * 0.1
+                # Positive for our pieces
+                self.model.start_conv.weight[:, i, :, :] += v * 0.01
+                # Negative for opponent pieces
+                self.model.start_conv.weight[:, i+6, :, :] -= v * 0.01
         print("[ModelManager] Starter pack initialized.")
 
     def download_starter_weights(self):

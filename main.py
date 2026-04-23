@@ -177,143 +177,14 @@ def play_move(req: MoveRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/api/model")
-async def get_onnx_model():
-    """
-    Serve the latest chess_model.onnx.
-    Prioritizes local file for speed. If missing, proxies from Vercel Blob
-    (Proxying is required because Blob stores are often private, so redirecting fails).
-    """
-    onnx_filename = model_manager.onnx_filename
-
-    # 1. Fallback: serve from local disk (Quickest)
-    if os.path.exists(onnx_filename):
-        print(f"[/api/model] Serving local file: {onnx_filename}")
-        with open(onnx_filename, "rb") as f:
-            data = f.read()
-        version = hashlib.sha256(data).hexdigest()[:16]
-        return Response(
-            content=data,
-            media_type="application/octet-stream",
-            headers={"x-model-version": version, "cache-control": "no-store"},
-        )
-
-    # 2. Proxy from Vercel Blob
-    blob_token = model_manager.blob_token
-    if blob_token:
-        try:
-            headers = {"Authorization": f"Bearer {blob_token}"}
-            async with httpx.AsyncClient() as client:
-                # Find the URL
-                resp = await client.get(
-                    "https://blob.vercel-storage.com",
-                    headers=headers,
-                    timeout=10.0,
-                )
-                if resp.status_code == 200:
-                    blobs = resp.json().get("blobs", [])
-                    urls = [b["url"] for b in blobs if b["pathname"] == onnx_filename]
-                    if urls:
-                        # Proxy the binary data instead of redirecting
-                        model_resp = await client.get(urls[0], headers=headers, timeout=30.0)
-                        if model_resp.status_code == 200:
-                            print(f"[/api/model] Served via Blob proxy: {urls[0]}")
-                            payload = model_resp.content
-                            version = hashlib.sha256(payload).hexdigest()[:16]
-                            return Response(
-                                content=payload,
-                                media_type="application/octet-stream",
-                                headers={"x-model-version": version, "cache-control": "no-store"},
-                            )
-        except Exception as e:
-            print(f"[/api/model] Blob lookup failed: {e}")
-
-    raise HTTPException(status_code=404, detail="ONNX model not found.")
-
-
-@app.get("/api/model/metadata")
-async def get_model_metadata():
-    """Returns lightweight model metadata for version polling."""
-    onnx_filename = model_manager.onnx_filename
-    if os.path.exists(onnx_filename):
-        with open(onnx_filename, "rb") as f:
-            data = f.read()
-        return {
-            "available": True,
-            "version": hashlib.sha256(data).hexdigest()[:16],
-            "bytes": len(data),
-            "source": "local",
-        }
-
-    blob_token = model_manager.blob_token
-    if blob_token:
-        try:
-            headers = {"Authorization": f"Bearer {blob_token}"}
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    "https://blob.vercel-storage.com",
-                    headers=headers,
-                    timeout=10.0,
-                )
-                if resp.status_code == 200:
-                    blobs = resp.json().get("blobs", [])
-                    urls = [b["url"] for b in blobs if b["pathname"] == onnx_filename]
-                    if urls:
-                        model_resp = await client.get(urls[0], headers=headers, timeout=30.0)
-                        if model_resp.status_code == 200:
-                            payload = model_resp.content
-                            return {
-                                "available": True,
-                                "version": hashlib.sha256(payload).hexdigest()[:16],
-                                "bytes": len(payload),
-                                "source": "blob",
-                            }
-        except Exception as e:
-            return {"available": False, "error": f"metadata lookup failed: {e}"}
-
-    return {"available": False}
-
-
-@app.get("/api/contracts")
-async def get_runtime_contracts():
-    """Runtime smoke-check for model input/output contracts used by frontend."""
-    try:
-        model = model_manager.model
-        model.eval()
-
-        with torch.no_grad():
-            dummy = torch.zeros((1, 64, 12), dtype=torch.float32)
-            out = model(dummy)
-
-        if not hasattr(out, "shape"):
-            raise RuntimeError("Model output has no shape attribute.")
-
-        shape = list(out.shape)
-        finite = bool(torch.isfinite(out).all().item())
-
-        # Keep payload compact but actionable for clients and dashboards.
-        return {
-            "tensor_contract": {
-                "input_name": "board",
-                "input_shape": [1, 64, 12],
-                "output_name": "value",
-                "expected_output_shape": [1, 1],
-                "actual_output_shape": shape,
-                "finite_output": finite,
-            },
-            "semantics": {
-                "value_range": "[-1, 1]",
-                "perspective": "side-to-move",
-                "training_result_encoding": {
-                    "white_win": 1.0,
-                    "draw": 0.0,
-                    "black_win": -1.0,
-                },
-            },
-            "model": await get_model_metadata(),
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Contract check failed: {e}")
+@app.get("/api/model/status")
+async def get_model_status():
+    """Returns the current model status."""
+    return {
+        "architecture": "ResNet",
+        "loaded": model_manager._loaded_checkpoint,
+        "device": str(next(model_manager.model.parameters()).device)
+    }
 
 security = HTTPBasic()
 
@@ -349,19 +220,9 @@ async def train(req: TrainRequest, username: str = Depends(verify_credentials)):
         )
         # Record stats async
         await stats_manager.add_stat(avg_loss)
-        # Refresh local ONNX immediately so live clients can sync.
-        # Blob upload is intentionally deferred to periodic/shutdown save schedule.
-        export_ok = await model_manager.export_to_onnx(upload_to_blob=False)
-        if not export_ok:
-            raise HTTPException(
-                status_code=500,
-                detail=(
-                    "Training completed but local ONNX export failed: "
-                    f"{model_manager.last_export_error or 'unknown error'}"
-                ),
-            )
+        
         return {
-            "message": "Training successful (ONNX Blob upload deferred to scheduled save).",
+            "message": "Training successful.",
             "loss": avg_loss,
         }
     except HTTPException:
