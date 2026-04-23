@@ -25,3 +25,4 @@ uv run uvicorn main:app --port 8000 --reload
 - `GET /` - Health check.
 - `POST /api/move` - Calculates and returns the smartest move (JSON body requires `fen`).
 - `POST /api/train` - Protected/Admin endpoint. Trains the model from a completed game history (requires `fens` array and `result` float).
+
