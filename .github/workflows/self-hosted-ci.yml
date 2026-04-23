@@ -3,9 +3,10 @@ name: Self-Hosted CI
 on:
   push:
     branches:
-      - main
+      - master
   pull_request:
-
+    branches:
+      - master
 jobs:
   validate:
     runs-on: [self-hosted, Linux, X64]
