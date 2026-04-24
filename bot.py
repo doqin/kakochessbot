@@ -4,34 +4,36 @@ import torch.nn.functional as F
 from model import model_manager
 from typing import Optional
 
+def move_to_index(move: chess.Move) -> int:
+    """Maps a chess move to an index 0-4095."""
+    return move.from_square * 64 + move.to_square
+
 def fen_to_tensor(fen: str) -> torch.Tensor:
     """
-    Converts a FEN string to a (1, 64, 12) sequence tensor with PERSPECTIVE flipping.
-    Each of the 64 tokens is a 12-dimensional vector identifying the piece.
+    Converts a FEN string to a (1, 13, 8, 8) tensor.
+    13 planes: 6 White pieces, 6 Black pieces, 1 side-to-move.
     """
     board = chess.Board(fen)
-    # (Batch, Sequence, Features)
-    tensor = torch.zeros((1, 64, 12), dtype=torch.float32)
+    tensor = torch.zeros((1, 13, 8, 8), dtype=torch.float32)
     
     piece_to_index = {
         chess.PAWN: 0, chess.KNIGHT: 1, chess.BISHOP: 2,
         chess.ROOK: 3, chess.QUEEN: 4, chess.KING: 5
     }
     
-    current_turn = board.turn # True for White, False for Black
-    
     for sq in chess.SQUARES:
         piece = board.piece_at(sq)
         if piece is not None:
-            # Determine relative color
-            is_my_piece = (piece.color == current_turn)
-            color_offset = 0 if is_my_piece else 6
-            
-            # Determine relative square index (Perspective flip)
-            display_sq = sq if current_turn == chess.WHITE else (sq ^ 56)
-            
+            color_offset = 0 if piece.color == chess.WHITE else 6
             idx_feat = piece_to_index[piece.piece_type] + color_offset
-            tensor[0, display_sq, idx_feat] = 1.0
+            
+            row = sq // 8
+            col = sq % 8
+            tensor[0, idx_feat, row, col] = 1.0
+            
+    # Plane 12: Side to move (1.0 for White, 0.0 for Black)
+    if board.turn == chess.WHITE:
+        tensor[0, 12, :, :] = 1.0
             
     return tensor
 
@@ -53,8 +55,11 @@ def get_material_balance(board: chess.Board) -> float:
     balance = my_score - opp_score
     return min(max(balance * 0.05, -1.0), 1.0)
 
-def evaluate_board(board: chess.Board, history: list = None) -> float:
-    """Evaluates the board from the CURRENT player's perspective."""
+def evaluate_board(board: chess.Board, history: list = None) -> tuple[torch.Tensor, float]:
+    """
+    Evaluates the board from the CURRENT player's perspective.
+    Returns (policy_logits, scalar_value).
+    """
     
     def get_pos_key(f):
         parts = f.split(" ")
@@ -68,34 +73,47 @@ def evaluate_board(board: chess.Board, history: list = None) -> float:
                 repetition_count += 1
 
     if board.is_game_over() or repetition_count >= 2:
+        # Mock policy for terminal states
+        policy_mock = torch.zeros((1, 4096))
         if board.is_checkmate():
-            return -1.0 # Current side to move just got mated
-        return 0.0 # Standardize draw evaluation
+            return policy_mock, -1.0
+        return policy_mock, 0.0
 
-    # 3. Mid-game evaluation (Perspective-aware)
     tensor = fen_to_tensor(board.fen())
     model_manager.model.eval()
     with torch.no_grad():
-        nn_val = model_manager.model(tensor).item()
+        policy_logits, value = model_manager.model(tensor)
         
     material_val = get_material_balance(board)
-    combined_val = (nn_val * 0.6) + (material_val * 0.4)
+    combined_val = (value.item() * 0.7) + (material_val * 0.3)
 
     if repetition_count == 1:
-        combined_val -= 0.15 # Penalty for repeating
+        combined_val -= 0.15 
 
-    return combined_val
+    return policy_logits, combined_val
 
 def alphabeta(board: chess.Board, depth: int, alpha: float, beta: float, history: list = None) -> float:
-    """Negamax implementation (Implicitly perspective-aware)."""
+    """Negamax implementation with Policy-guided move ordering."""
     if depth == 0 or board.is_game_over():
-        return evaluate_board(board, history)
+        _, val = evaluate_board(board, history)
+        return val
         
+    policy_logits, _ = evaluate_board(board, history)
+    probs = F.softmax(policy_logits, dim=1).flatten()
+    
+    # Order moves by policy probability for better pruning
+    moves = list(board.legal_moves)
+    move_scores = []
+    for move in moves:
+        score = probs[move_to_index(move)].item()
+        move_scores.append((score, move))
+    
+    move_scores.sort(key=lambda x: x[0], reverse=True)
+    
     value = -float('inf')
-    for move in board.legal_moves:
+    for _, move in move_scores:
         board.push(move)
         new_history = (history + [board.fen()]) if history else [board.fen()]
-        # In Negamax, value = -search()
         child_val = -alphabeta(board, depth - 1, -beta, -alpha, new_history)
         board.pop()
         
@@ -119,7 +137,16 @@ def get_best_move(
         return ""
         
     if fen == chess.STARTING_FEN:
-        return random.choice(["e2e4", "d2d4", "c2c4", "g1f3"])
+        return "c2c4" # English Opening
+        
+    # Sicilian Defense: Response to 1. e4
+    if board.fullmove_number == 1 and board.turn == chess.BLACK:
+        e4_pawn = board.piece_at(chess.E4)
+        if e4_pawn and e4_pawn.piece_type == chess.PAWN and e4_pawn.color == chess.WHITE:
+            # Check if c5 is legal (it should be)
+            c5_move = chess.Move.from_uci("c7c5")
+            if c5_move in board.legal_moves:
+                return "c7c5"
         
     if is_training:
         eps = epsilon if epsilon is not None else (0.25 if board.fullmove_number < 10 else 0.05)
@@ -144,12 +171,11 @@ def get_best_move(
                 
     return best_move.uci() if best_move else ""
 
-def train_bot(game_fens: list, result_val: float, lr: float = 0.0001, discount_factor: float = 0.95):
+def train_bot(game_fens: list, game_moves: list, result_val: float, lr: float = 0.0001, discount_factor: float = 0.95):
     """
-    Trains on Perspective-Aware targets using BATCH updates.
-    result_val: 1.0 (White won), -1.0 (Black won), 0.0 (Draw)
+    Trains on Dual Heads (Policy + Value).
     """
-    if not game_fens:
+    if not game_fens or len(game_fens) != len(game_moves):
         return 0
         
     model_manager.model.train()
@@ -160,73 +186,46 @@ def train_bot(game_fens: list, result_val: float, lr: float = 0.0001, discount_f
     total_loss = 0.0
     valid_loss_count = 0
     
-    # 1. Detection of game-ending state (e.g. repetition)
-    is_repetition = False
-    if result_val == 0.0 and len(game_fens) > 1:
-        final_board = chess.Board(game_fens[-1])
-        if final_board.is_repetition(3):
-            is_repetition = True
+    policy_criterion = torch.nn.CrossEntropyLoss()
+    value_criterion = torch.nn.MSELoss()
 
-    # 2. Build training data and calculate rewards
     for i, fen in enumerate(game_fens):
         board = chess.Board(fen)
         
-        # Base Reward from final outcome
-        if result_val != 0.0:
-            side_to_move_winner = (result_val == 1.0 and board.turn == chess.WHITE) or \
-                                 (result_val == -1.0 and board.turn == chess.BLACK)
-            base_target = 1.0 if side_to_move_winner else -1.0
-        else:
-            # Draw handling with Repetition Penalty
-            material = get_material_balance(board)
-            if is_repetition and material > 0.2:
-                # Penalize for forcing a draw when winning
-                base_target = -0.1
-            else:
-                base_target = material
-
-        # Reliability-first weighting: keep late/terminal plies strongest.
+        # 1. Value Target (Discounted outcome)
+        side_to_move_winner = (result_val == 1.0 and board.turn == chess.WHITE) or \
+                             (result_val == -1.0 and board.turn == chess.BLACK)
+        base_v_target = 1.0 if (result_val != 0 and side_to_move_winner) else (0.0 if result_val == 0 else -1.0)
         remaining_plies = (len(game_fens) - 1) - i
-        discounted_target = base_target * (discount_factor ** remaining_plies)
+        v_target = base_v_target * (discount_factor ** remaining_plies)
         
-        # Tactical Shaping: Simple check for hanging pieces in current state
-        # (This gives dense rewards to avoid blunders)
-        tactical_penalty = 0.0
-        for sq in chess.SQUARES:
-            piece = board.piece_at(sq)
-            if piece and piece.color == board.turn:
-                # Is my piece attacked and undefended?
-                if board.is_attacked_by(not board.turn, sq) and not board.is_attacked_by(board.turn, sq):
-                    val_map = {1:0.05, 2:0.1, 3:0.1, 4:0.15, 5:0.25, 6:0.0}
-                    tactical_penalty += val_map.get(piece.piece_type, 0)
-        
-        target = discounted_target - min(tactical_penalty, 0.5)
-        target = max(-1.0, min(1.0, target))
+        # 2. Policy Target (The move actually played)
+        played_move = game_moves[i]
+        if isinstance(played_move, str):
+            move_obj = chess.Move.from_uci(played_move)
+        else:
+            move_obj = played_move
+        p_target = torch.tensor([move_to_index(move_obj)], dtype=torch.long)
 
         # Forward pass
         tensor = fen_to_tensor(fen)
-        prediction = model_manager.model(tensor)
-        target_tensor = torch.tensor([[target]], dtype=torch.float32)
+        policy_logits, value_pred = model_manager.model(tensor)
         
-        loss = model_manager.criterion(prediction, target_tensor)
-        if not torch.isfinite(loss):
-            print(f"[Training] Skipping non-finite loss at ply {i}.")
-            continue
+        v_loss = value_criterion(value_pred, torch.tensor([[v_target]], dtype=torch.float32))
+        p_loss = policy_criterion(policy_logits, p_target)
+        
+        loss = v_loss + p_loss
+        
+        if not torch.isfinite(loss): continue
 
         loss.backward()
         total_loss += loss.item()
         valid_loss_count += 1
 
-    # 3. Batch Update (Normalize by move count)
-    # Scale gradients manually before step if needed, but standard optimizer.step() 
-    # after multiple backward() calls behaves like batch summation.
-    if valid_loss_count == 0:
-        model_manager.optimizer.zero_grad(set_to_none=True)
-        raise RuntimeError("Training aborted: no finite loss values were produced.")
-
-    torch.nn.utils.clip_grad_norm_(model_manager.model.parameters(), max_norm=1.0)
-    model_manager.optimizer.step()
-
-    avg_loss = total_loss / valid_loss_count
-    print(f"Training Batch complete. Game Result: {result_val}, Avg Loss: {avg_loss:.6f}")
-    return avg_loss
+    if valid_loss_count > 0:
+        torch.nn.utils.clip_grad_norm_(model_manager.model.parameters(), max_norm=1.0)
+        model_manager.optimizer.step()
+        avg_loss = total_loss / valid_loss_count
+        print(f"Training Batch complete. Avg Loss: {avg_loss:.6f}")
+        return avg_loss
+    return 0
