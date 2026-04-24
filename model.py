@@ -58,13 +58,18 @@ class ChessResNet(nn.Module):
         for block in self.res_blocks:
             x = block(x)
             
+        # Policy Head
+        p = F.relu(self.policy_bn(self.policy_conv(x)))
+        p = p.view(-1, 2 * 64)
+        policy = self.policy_fc(p) # Logits for 64*64 moves
+            
         # Value Head
         v = F.relu(self.value_bn(self.value_conv(x)))
         v = v.view(-1, 64)
         v = F.relu(self.value_fc1(v))
         value = torch.tanh(self.value_fc2(v))
         
-        return value
+        return policy, value
 
 class ModelManager:
     def __init__(self):
@@ -72,7 +77,7 @@ class ModelManager:
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=0.0001)
         self.criterion = nn.MSELoss()
         self.blob_token = os.environ.get("BLOB_READ_WRITE_TOKEN", "")
-        self.model_filename = "chess_model_v2.pt"
+        self.model_filename = "chess_model_alphazero.pt"
         self.last_checkpoint_load_error = None
         self._loaded_checkpoint = False
         

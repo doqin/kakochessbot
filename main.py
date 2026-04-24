@@ -100,7 +100,7 @@ def _same_position_state(a: chess.Board, b: chess.Board) -> bool:
     )
 
 
-def validate_train_request(req: TrainRequest):
+def validate_train_request(req: TrainRequest) -> List[str]:
     if not req.fens:
         raise HTTPException(status_code=422, detail="Training payload must include at least one FEN.")
 
@@ -113,6 +113,7 @@ def validate_train_request(req: TrainRequest):
     if not (0.0 <= req.discount_factor <= 1.0):
         raise HTTPException(status_code=422, detail="discount_factor must be in [0.0, 1.0].")
 
+    moves = []
     for idx, fen in enumerate(req.fens):
         try:
             chess.Board(fen)
@@ -130,28 +131,31 @@ def validate_train_request(req: TrainRequest):
                 detail=f"Invalid sequence at index {idx}: side-to-move did not alternate.",
             )
 
-        if prev.is_game_over():
-            raise HTTPException(
-                status_code=422,
-                detail=f"Invalid sequence at index {idx}: previous position is already game-over.",
-            )
-
-        progressed = False
+        move_found = None
         for mv in prev.legal_moves:
             prev.push(mv)
             if _same_position_state(prev, nxt):
-                progressed = True
+                move_found = mv.uci()
                 prev.pop()
                 break
             prev.pop()
 
-        if not progressed:
+        if not move_found:
             raise HTTPException(
                 status_code=422,
                 detail=(
                     f"Invalid sequence at index {idx}: position is not reachable from prior FEN by one legal move."
                 ),
             )
+        moves.append(move_found)
+    
+    # Pad last move if needed (though usually we train on N-1 moves)
+    # To keep list lengths equal:
+    if fens_count := len(req.fens):
+        if len(moves) < fens_count:
+            moves.append(moves[-1] if moves else "0000") # Dummy move for terminal state
+
+    return moves
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -181,7 +185,7 @@ def play_move(req: MoveRequest):
 async def get_model_status():
     """Returns the current model status."""
     return {
-        "architecture": "ResNet",
+        "architecture": "AlphaZero-style ResNet",
         "loaded": model_manager._loaded_checkpoint,
         "device": str(next(model_manager.model.parameters()).device)
     }
@@ -208,12 +212,13 @@ async def get_stats():
 async def train(req: TrainRequest, username: str = Depends(verify_credentials)):
     """Note: Train is a 'def' endpoint, so it runs in a threadpool and won't block the loop."""
     try:
-        validate_train_request(req)
+        moves = validate_train_request(req)
 
         # Run training in threadpool
         avg_loss = await asyncio.to_thread(
             train_bot,
             req.fens, 
+            moves,
             req.result, 
             lr=req.learning_rate, 
             discount_factor=req.discount_factor
