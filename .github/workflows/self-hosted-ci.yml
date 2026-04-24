@@ -10,6 +10,7 @@ on:
 jobs:
   validate:
     runs-on: [self-hosted, Linux, X64]
+    environment: Production
     env:
       BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN || '' }}
       ADMIN_USERNAME: ${{ secrets.ADMIN_USERNAME || 'admin' }}
